@@ -155,11 +155,28 @@ class scaled_fp8_quant_kernel_strided_dynamic {
   }
 };
 
-template <typename scalar_t, typename fp8_type>
+// UE8M0 scales are powers of two, so the fp32 value carries no more
+// information than the biased exponent byte that E8M0 stores.
+template <typename scale_t>
+struct GroupScaleStore;
+
+template <>
+struct GroupScaleStore<float> {
+  static inline void store(float* p, float y_s, float /*y_exp*/) { *p = y_s; }
+};
+
+template <>
+struct GroupScaleStore<uint8_t> {
+  static inline void store(uint8_t* p, float /*y_s*/, float y_exp) {
+    *p = static_cast<uint8_t>(sycl::clamp(y_exp + 127.0f, 0.0f, 255.0f));
+  }
+};
+
+template <typename scalar_t, typename fp8_type, typename scale_t = float>
 class per_token_group_quant_8bit_kernel {
  private:
   fp8_type* out;
-  float* scale;
+  scale_t* scale;
   scalar_t const* input;
   const int group_size;
   const int groups_per_block;
@@ -172,7 +189,7 @@ class per_token_group_quant_8bit_kernel {
  public:
   per_token_group_quant_8bit_kernel(
       fp8_type* out_,
-      float* scale_,
+      scale_t* scale_,
       scalar_t const* input_,
       const int group_size_,
       const int groups_per_block_,
@@ -208,15 +225,14 @@ class per_token_group_quant_8bit_kernel {
         static_cast<int64_t>(global_group_id) * group_size;
 
     float local_absmax = eps;
-    float* scale_output;
+    scale_t* scale_output;
 
     scalar_t const* group_input = &input[block_group_offset];
     fp8_type* group_output = &out[block_group_offset];
     if (is_column_major) {
       const int row_idx = global_group_id / scale_num_rows;
       const int col_idx = global_group_id % scale_num_rows;
-      scale_output =
-          reinterpret_cast<float*>(scale) + (col_idx * scale_stride + row_idx);
+      scale_output = scale + (col_idx * scale_stride + row_idx);
     } else {
       scale_output = &scale[global_group_id];
     }
@@ -240,13 +256,14 @@ class per_token_group_quant_8bit_kernel {
         local_absmax / fp8::fp8_max_f<fp8_type>::value,
         fp8::min_scaling_factor<fp8_type>::val());
 
+    float y_exp = 0.0f;
     if (scale_ue8m0) {
-      y_s = sycl::exp2(
-          sycl::ceil(sycl::log2(sycl::fmax(sycl::fabs(y_s), 1e-10f))));
+      y_exp = sycl::ceil(sycl::log2(sycl::fmax(sycl::fabs(y_s), 1e-10f)));
+      y_s = sycl::exp2(y_exp);
     }
 
     if (lane_id == 0) {
-      *scale_output = y_s;
+      GroupScaleStore<scale_t>::store(scale_output, y_s, y_exp);
     }
     group_barrier(item.get_group());
 
@@ -276,11 +293,11 @@ class per_token_group_quant_8bit_kernel {
 // cover a group. This maximizes global-memory bandwidth versus the
 // 1-element-per-thread path. Used for the common case where group_size is a
 // multiple of VEC.
-template <typename scalar_t, typename fp8_type>
+template <typename scalar_t, typename fp8_type, typename scale_t = float>
 class per_token_group_quant_8bit_vec_kernel {
  private:
   fp8_type* out;
-  float* scale;
+  scale_t* scale;
   scalar_t const* input;
   const int group_size;
   const int hidden;
@@ -294,7 +311,7 @@ class per_token_group_quant_8bit_vec_kernel {
  public:
   per_token_group_quant_8bit_vec_kernel(
       fp8_type* out_,
-      float* scale_,
+      scale_t* scale_,
       scalar_t const* input_,
       const int group_size_,
       const int hidden_,
@@ -357,15 +374,16 @@ class per_token_group_quant_8bit_vec_kernel {
       float y_s = sycl::max(
           gmax / fp8::quant_type_max_v<fp8_type>,
           fp8::min_scaling_factor<fp8_type>::val());
+      float y_exp = 0.0f;
       if (scale_ue8m0) {
-        y_s = sycl::exp2(
-            sycl::ceil(sycl::log2(sycl::fmax(sycl::fabs(y_s), 1e-10f))));
+        y_exp = sycl::ceil(sycl::log2(sycl::fmax(sycl::fabs(y_s), 1e-10f)));
+        y_s = sycl::exp2(y_exp);
       }
 
       if (active && (lane % lanes_per_group) == 0) {
         const int g_idx = c / lanes_per_group;
         const int global_group = row * num_groups_per_row + g_idx;
-        float* scale_output;
+        scale_t* scale_output;
         if (is_column_major) {
           const int row_idx = global_group / scale_num_rows;
           const int col_idx = global_group % scale_num_rows;
@@ -373,7 +391,7 @@ class per_token_group_quant_8bit_vec_kernel {
         } else {
           scale_output = scale + global_group;
         }
-        *scale_output = y_s;
+        GroupScaleStore<scale_t>::store(scale_output, y_s, y_exp);
       }
 
       if (active) {
@@ -833,6 +851,16 @@ void per_token_group_quant_fp8(
   const int scale_num_rows = output_s.size(1);
   const int scale_stride = output_s.stride(1);
 
+  const bool scale_is_e8m0 =
+      output_s.scalar_type() == at::ScalarType::Float8_e8m0fnu;
+  TORCH_CHECK(
+      scale_is_e8m0 || output_s.scalar_type() == at::ScalarType::Float,
+      "per_token_group_fp8_quant: output_s must be float32 or float8_e8m0fnu");
+  TORCH_CHECK(
+      !scale_is_e8m0 || scale_ue8m0,
+      "per_token_group_fp8_quant: float8_e8m0fnu output_s requires "
+      "scale_ue8m0=true");
+
   // Fast vectorized path: one work-group per row with 16-byte loads. Requires
   // group_size to be a multiple of the (dtype-dependent) vector width.
   const int num_tokens = output_s.size(0);
@@ -850,62 +878,88 @@ void per_token_group_quant_fp8(
     sycl::range<1> vgrid(num_tokens);
     sycl::range<1> vblock(wg);
     auto& vqueue = vllm::xpu::vllmGetQueue();
-    VLLM_DISPATCH_FLOATING_TYPES(
-        input.scalar_type(), "per_token_group_quant_8bit_vec_scale_type", [&] {
-          VLLM_DISPATCH_FP8_TYPES(
-              output_q.scalar_type(),
-              "per_token_group_quant_8bit_vec_fp8_type",
-              [&] {
-                vqueue.submit([&](sycl::handler& cgh) {
-                  auto kernel = vllm::
-                      per_token_group_quant_8bit_vec_kernel<scalar_t, fp8_t>(
-                          output_q.data_ptr<fp8_t>(),
-                          output_s.data_ptr<float>(),
-                          input.data_ptr<scalar_t>(),
-                          group_size,
-                          hidden,
-                          num_groups_per_row,
-                          eps,
-                          scale_ue8m0,
-                          scale_num_rows,
-                          scale_stride,
-                          is_column_major);
-                  cgh.parallel_for(
-                      sycl::nd_range<1>(vgrid * vblock, vblock), kernel);
+    auto launch_vec = [&](auto scale_tag) {
+      using scale_t = decltype(scale_tag);
+      auto* scale_ptr = reinterpret_cast<scale_t*>(output_s.data_ptr());
+      VLLM_DISPATCH_FLOATING_TYPES(
+          input.scalar_type(),
+          "per_token_group_quant_8bit_vec_scale_type",
+          [&] {
+            VLLM_DISPATCH_FP8_TYPES(
+                output_q.scalar_type(),
+                "per_token_group_quant_8bit_vec_fp8_type",
+                [&] {
+                  vqueue.submit([&](sycl::handler& cgh) {
+                    auto kernel = vllm::per_token_group_quant_8bit_vec_kernel<
+                        scalar_t,
+                        fp8_t,
+                        scale_t>(
+                        output_q.data_ptr<fp8_t>(),
+                        scale_ptr,
+                        input.data_ptr<scalar_t>(),
+                        group_size,
+                        hidden,
+                        num_groups_per_row,
+                        eps,
+                        scale_ue8m0,
+                        scale_num_rows,
+                        scale_stride,
+                        is_column_major);
+                    cgh.parallel_for(
+                        sycl::nd_range<1>(vgrid * vblock, vblock), kernel);
+                  });
                 });
-              });
-        });
+          });
+    };
+    if (scale_is_e8m0) {
+      launch_vec(uint8_t{});
+    } else {
+      launch_vec(float{});
+    }
     return;
   }
 
   sycl::range<1> grid(num_blocks);
   sycl::range<1> block(num_threads);
   auto& queue = vllm::xpu::vllmGetQueue();
-  VLLM_DISPATCH_FLOATING_TYPES(
-      input.scalar_type(), "per_token_group_quant_8bit_kernel_scale_type", [&] {
-        VLLM_DISPATCH_FP8_TYPES(
-            output_q.scalar_type(),
-            "per_token_group_quant_8bit_kernel_fp8_type",
-            [&] {
-              // Launch the kernel
-              queue.submit([&](sycl::handler& cgh) {
-                auto kernel =
-                    vllm::per_token_group_quant_8bit_kernel<scalar_t, fp8_t>(
-                        output_q.data_ptr<fp8_t>(),
-                        output_s.data_ptr<float>(),
-                        input.data_ptr<scalar_t>(),
-                        group_size,
-                        groups_per_block,
-                        eps,
-                        scale_ue8m0,
-                        scale_num_rows,
-                        scale_stride,
-                        is_column_major);
-                cgh.parallel_for(
-                    sycl::nd_range<1>(grid * block, block), kernel);
+  auto launch = [&](auto scale_tag) {
+    using scale_t = decltype(scale_tag);
+    auto* scale_ptr = reinterpret_cast<scale_t*>(output_s.data_ptr());
+    VLLM_DISPATCH_FLOATING_TYPES(
+        input.scalar_type(),
+        "per_token_group_quant_8bit_kernel_scale_type",
+        [&] {
+          VLLM_DISPATCH_FP8_TYPES(
+              output_q.scalar_type(),
+              "per_token_group_quant_8bit_kernel_fp8_type",
+              [&] {
+                // Launch the kernel
+                queue.submit([&](sycl::handler& cgh) {
+                  auto kernel = vllm::per_token_group_quant_8bit_kernel<
+                      scalar_t,
+                      fp8_t,
+                      scale_t>(
+                      output_q.data_ptr<fp8_t>(),
+                      scale_ptr,
+                      input.data_ptr<scalar_t>(),
+                      group_size,
+                      groups_per_block,
+                      eps,
+                      scale_ue8m0,
+                      scale_num_rows,
+                      scale_stride,
+                      is_column_major);
+                  cgh.parallel_for(
+                      sycl::nd_range<1>(grid * block, block), kernel);
+                });
               });
-            });
-      });
+        });
+  };
+  if (scale_is_e8m0) {
+    launch(uint8_t{});
+  } else {
+    launch(float{});
+  }
 }
 
 void dynamic_per_token_scaled_fp8_quant(
